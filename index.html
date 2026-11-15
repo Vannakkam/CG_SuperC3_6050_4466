@@ -166,7 +166,7 @@ async function pair(){
   if(!navigator.bluetooth){setStatus('Web Bluetooth unavailable: use Chrome/Edge on a supported device over HTTPS or localhost.');return;}
   connectionBusy=true;refreshButtons();
   try{
-    device=await navigator.bluetooth.requestDevice({filters:[{name:'C3-IMU-MIC'}],optionalServices:[SERVICE]});
+    device = await navigator.bluetooth.requestDevice({acceptAllDevices: true,optionalServices: [SERVICE]});
     device.addEventListener('gattserverdisconnected',onDisconnected);
     server=await device.gatt.connect();
     const svc=await server.getPrimaryService(SERVICE);
