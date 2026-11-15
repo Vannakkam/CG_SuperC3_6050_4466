@@ -35,9 +35,14 @@ footer {font-size:13px;color:var(--muted);margin-top:18px}
   <button class="stop" id="stop" disabled>3. Stop Recording</button>
   <button id="imuCsv" disabled>4. Download IMU CSV</button>
   <button id="micCsv" disabled>Download Mic CSV</button>
-  <button id="micWav" disabled>Download Mic WAV</button>
+  <button id="micWav" disabled>Download Raw WAV</button>
+  <button id="speechWav" disabled>Download Denoised Speech WAV</button>
+  <button id="heartWav" disabled>Download Heart WAV</button>
   <button id="refresh">5. Refresh Data</button>
 </div>
+<div class="panel" style="margin:12px 0"><strong>Offline audio processing</strong><p style="margin:5px 0 8px">Raw WAV is never modified. Speech uses harmonic hum suppression, persistent-tone reduction, Wiener-style spectral filtering and a smoothed voice gate. Heart mode is 25–400 Hz band-pass only; neither processed export is for medical diagnosis.</p>
+<label><input type="checkbox" id="speechGate" checked> Apply voice-activity gate to speech (uncheck for a more natural sound)</label>
+<div id="processing" aria-live="polite" style="color:var(--muted);font-size:13px;margin-top:8px">Processing runs locally in your browser after recording stops.</div></div>
 <div class="metrics">
   <div class="metric"><span>Connection</span><strong id="connection">Offline</strong></div>
   <div class="metric"><span>IMU samples</span><strong id="imuN">0</strong></div>
@@ -49,6 +54,215 @@ footer {font-size:13px;color:var(--muted);margin-top:18px}
 <section class="panel"><h2>Event log</h2><div id="log" aria-live="polite">Waiting for connection…</div></section>
 <footer>* Sequence gaps include sampling deadlines missed on the ESP32 and BLE packets missing at the browser. Device ring-buffer overflows are reported separately in the event log. WAV is 16-bit PCM mono at the nominal 16,000 Hz rate, with missing sequence samples filled with silence; refresh only clears plots, not stored samples. Browser time sync is approximate because BLE write latency is variable. No persistent storage or retransmission on the ESP32.</footer>
 </main>
+<script id="dsp-worker" type="text/plain">
+// Runs in a Web Worker. Offline JS adaptation of user-provided denoise4.py.
+'use strict';
+const progress=message=>postMessage({type:'progress',message});
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+function biquad(x,fs,f,type,Q=0.707){
+  f=clamp(f,0.001,fs*0.49);const w=2*Math.PI*f/fs,c=Math.cos(w),sn=Math.sin(w),a=sn/(2*Q);
+  let b0,b1,b2;
+  if(type==='notch'){b0=1;b1=-2*c;b2=1;}
+  else if(type==='hp'){b0=(1+c)/2;b1=-(1+c);b2=(1+c)/2;}
+  else {b0=(1-c)/2;b1=1-c;b2=(1-c)/2;}
+  const A0=1+a,A1=-2*c/A0,A2=(1-a)/A0;
+  b0/=A0;b1/=A0;b2/=A0;
+  let s1=0,s2=0;const out=new Float32Array(x.length);
+  for(let i=0;i<x.length;i++){
+    const v=x[i],y=b0*v+s1;
+    s1=b1*v-A1*y+s2;s2=b2*v-A2*y;out[i]=y;
+  }return out;
+}
+function forwardReverse(x,fs,f,type,Q){
+  let y=biquad(x,fs,f,type,Q);y.reverse();y=biquad(y,fs,f,type,Q);y.reverse();return y;
+}
+function bandpass(x,fs,lo,hi,stages=2){
+  for(let j=0;j<stages;j++){x=forwardReverse(x,fs,lo,'hp');x=forwardReverse(x,fs,hi,'lp');}
+  return x;
+}
+function fft(re,im,inverse=false){
+  const n=re.length;
+  for(let i=1,j=0;i<n;i++){
+    let b=n>>1;for(;j&b;b>>=1)j^=b;j^=b;
+    if(i<j){let z=re[i];re[i]=re[j];re[j]=z;z=im[i];im[i]=im[j];im[j]=z;}
+  }
+  for(let size=2;size<=n;size*=2){
+    const ang=(inverse?2:-2)*Math.PI/size,wr=Math.cos(ang),wi=Math.sin(ang);
+    for(let i=0;i<n;i+=size){let ur=1,ui=0;
+      for(let j=0;j<size/2;j++){
+        let a=i+j,b=a+size/2,r=ur*re[b]-ui*im[b],v=ur*im[b]+ui*re[b];
+        re[b]=re[a]-r;im[b]=im[a]-v;re[a]+=r;im[a]+=v;
+        const z=ur*wr-ui*wi;ui=ur*wi+ui*wr;ur=z;
+      }
+    }
+  }
+  if(inverse){for(let i=0;i<n;i++){re[i]/=n;im[i]/=n;}}
+}
+function powerSpectrum(x,nfft=32768){
+  const re=new Float64Array(nfft),im=new Float64Array(nfft);
+  const use=Math.min(nfft,x.length),offset=Math.max(0,Math.floor((x.length-use)/2));
+  for(let i=0;i<use;i++)re[i]=x[offset+i]*(0.5-0.5*Math.cos(2*Math.PI*i/Math.max(1,use-1)));
+  fft(re,im);const p=new Float64Array(nfft/2+1);
+  for(let k=0;k<p.length;k++)p[k]=re[k]*re[k]+im[k]*im[k];return p;
+}
+function estimateHum(x,fs){
+  const nfft=32768,p=powerSpectrum(x,nfft);
+  const get=f=>{const k=f*nfft/fs,i=Math.floor(k),q=k-i;if(i<1||i+1>=p.length)return 1e-12;return p[i]*(1-q)+p[i+1]*q+1e-12;};
+  let best=0,bestScore=-1e99;
+  for(let f=18;f<=70;f+=0.25){let score=0;
+    for(let k=2;k<=Math.min(30,Math.floor(2500/f));k++){
+      // Strong repeating low-frequency interference creates many harmonics.
+      const v=get(k*f),adj=(get(k*f-4)+get(k*f+4))*0.5;
+      score+=Math.log(1+v/(adj+1e-10))/Math.sqrt(k);
+    }
+    if(score>bestScore){bestScore=score;best=f;}
+  }
+  return {freq:best,score:bestScore};
+}
+function steadyTones(x,fs){
+  const nfft=2048,hop=1024,frames=Math.max(1,Math.floor((x.length-1)/hop)+1),bins=nfft/2+1;
+  // Use one quiet-frame running noise proxy per bin, then contrast with neighbors.
+  let floor=new Float64Array(bins).fill(Infinity),re=new Float64Array(nfft),im=new Float64Array(nfft);
+  for(let t=0;t<frames;t++){
+    re.fill(0);im.fill(0);for(let j=0;j<nfft;j++){
+      const k=t*hop+j;if(k<x.length)re[j]=x[k]*(0.5-0.5*Math.cos(2*Math.PI*j/(nfft-1)));
+    }fft(re,im);
+    for(let k=0;k<bins;k++){
+      const mag=Math.hypot(re[k],im[k]);floor[k]=Math.min(floor[k],mag);
+    }
+  }
+  // Find peaks in locally persistent spectral noise, with a conservative contrast threshold.
+  const tones=[];
+  for(let k=Math.ceil(300*nfft/fs);k<Math.floor(Math.min(6000,fs/2-200)*nfft/fs);k++){
+    let neighbors=[];for(let d=-20;d<=20;d++)if(d<-3||d>3)neighbors.push(Math.log(floor[clamp(k+d,0,bins-1)]+1e-7));
+    neighbors.sort((a,b)=>a-b);const med=neighbors[neighbors.length>>1];
+    const value=Math.log(floor[k]+1e-7)-med;
+    if(value>1.4&&floor[k]>=floor[k-1]&&floor[k]>=floor[k+1]){
+      const hz=k*fs/nfft;if(!tones.length||hz-tones[tones.length-1]>=45)tones.push(hz);
+    }
+  }
+  return tones.slice(0,24);
+}
+function stftWiener(x,fs){
+  const nfft=512,hop=128,nframes=Math.ceil(x.length/hop),bins=nfft/2+1;
+  const powers=new Float32Array(nframes*bins),re=new Float64Array(nfft),im=new Float64Array(nfft);
+  const hann=new Float64Array(nfft);for(let j=0;j<nfft;j++)hann[j]=0.5-0.5*Math.cos(2*Math.PI*j/nfft);
+  // Frames centered at t*hop (zero-padded at start/end).
+  for(let t=0;t<nframes;t++){
+    for(let j=0;j<nfft;j++){let i=t*hop+j-nfft/2;re[j]=i>=0&&i<x.length?x[i]*hann[j]:0;im[j]=0;}
+    fft(re,im);for(let k=0;k<bins;k++)powers[t*bins+k]=re[k]*re[k]+im[k]*im[k];
+  }
+  // Minimum-statistics noise floor over a sliding ~1.5 sec window, with smoothing.
+  const win=Math.max(5,Math.round(1.5*fs/hop));
+  const noise=new Float32Array(nframes*bins);
+  for(let k=0;k<bins;k++){
+    const deq=new Int32Array(nframes);let head=0,tail=0;
+    for(let t=0;t<nframes;t++){
+      const val=powers[t*bins+k];
+      while(tail>head&&powers[deq[tail-1]*bins+k]>=val)tail--;
+      deq[tail++]=t;
+      while(head<tail&&deq[head]<t-win)head++;
+      noise[t*bins+k]=Math.max(1e-11,powers[deq[head]*bins+k]*2.5);
+    }
+  }
+  const gain=new Float32Array(nframes*bins),prevGain=new Float32Array(bins).fill(1);
+  for(let t=0;t<nframes;t++){
+    for(let k=0;k<bins;k++){
+      const p=powers[t*bins+k],n=noise[t*bins+k],post=p/n;
+      const past=t?powers[(t-1)*bins+k]/Math.max(noise[(t-1)*bins+k],1e-11):post;
+      const xi=Math.max(.001,.97*prevGain[k]*prevGain[k]*past+.03*Math.max(post-1,0));
+      const g=clamp(xi/(1+xi),0.1,1);
+      gain[t*bins+k]=g;prevGain[k]=g;
+    }
+  }
+  const out=new Float32Array(x.length),norm=new Float32Array(x.length);
+  for(let t=0;t<nframes;t++){
+    for(let j=0;j<nfft;j++){
+      const i=t*hop+j-nfft/2;re[j]=i>=0&&i<x.length?x[i]*hann[j]:0;im[j]=0;
+    }fft(re,im);
+    for(let k=0;k<bins;k++){
+      let sum=0,cnt=0;
+      for(let dt=-1;dt<=1;dt++)for(let dk=-1;dk<=1;dk++){
+        const tt=t+dt,kk=k+dk;if(tt>=0&&tt<nframes&&kk>=0&&kk<bins){sum+=gain[tt*bins+kk];cnt++;}
+      }const g=sum/cnt;re[k]*=g;im[k]*=g;
+      if(k>0&&k<nfft/2){re[nfft-k]*=g;im[nfft-k]*=g;}
+    }
+    fft(re,im,true);
+    for(let j=0;j<nfft;j++){
+      const i=t*hop+j-nfft/2;if(i>=0&&i<x.length){out[i]+=re[j]*hann[j];norm[i]+=hann[j]*hann[j];}
+    }
+  }
+  for(let i=0;i<out.length;i++)out[i]/=Math.max(.001,norm[i]);return out;
+}
+function movingMean(x,n){const out=new Float32Array(x.length);let sum=0;for(let i=0;i<x.length;i++){
+  sum+=x[i];if(i>=n)sum-=x[i-n];out[i]=sum/Math.min(i+1,n);
+}return out;}
+function voiceGate(y,fs){
+  const frame=Math.round(.032*fs),hop=Math.round(.010*fs);
+  if(y.length<frame*3)return y;
+  const nf=Math.floor((y.length-frame)/hop)+1,energy=new Float32Array(nf),harm=new Float32Array(nf);
+  const minLag=Math.floor(fs/400),maxLag=Math.ceil(fs/70);
+  for(let t=0;t<nf;t++){
+    const pos=t*hop;let e=1e-12;
+    for(let j=0;j<frame;j+=2){const a=y[pos+j]*(.5-.5*Math.cos(2*Math.PI*j/frame));e+=a*a;}
+    energy[t]=Math.log10(e);
+    let best=0;
+    for(let lag=minLag;lag<=maxLag;lag+=3){let a=0;
+      for(let j=lag;j<frame;j+=4)a+=y[pos+j]*y[pos+j-lag];
+      best=Math.max(best,a);
+    }harm[t]=clamp(best*4/(e+1e-10),0,1);
+  }
+  function norm(a){const vals=Array.from(a).sort((a,b)=>a-b),lo=vals[Math.floor(.1*(vals.length-1))],hi=vals[Math.floor(.9*(vals.length-1))];
+    return Float32Array.from(a,v=>clamp((v-lo)/(hi-lo+1e-9),0,1));}
+  const en=norm(energy),ha=norm(harm),score=new Float32Array(nf);
+  for(let t=0;t<nf;t++)score[t]=.55*en[t]+.45*ha[t];
+  const sorted=Array.from(score).sort((a,b)=>a-b),thr=(sorted[Math.floor(.15*(nf-1))]+sorted[Math.floor(.85*(nf-1))])*.5;
+  const mask=new Float32Array(nf);
+  for(let t=0;t<nf;t++)if(score[t]>thr)for(let j=Math.max(0,t-6);j<=Math.min(nf-1,t+6);j++)mask[j]=1;
+  // Smooth approximately 150 ms, avoiding an abrupt gate.
+  const smooth=movingMean(mask,15),out=new Float32Array(y.length);
+  for(let i=0;i<y.length;i++){
+    const f=(i-frame/2)/hop,t=clamp(Math.floor(f),0,nf-1),t1=Math.min(nf-1,t+1),alpha=clamp(f-t,0,1);
+    const g=smooth[t]*(1-alpha)+smooth[t1]*alpha;out[i]=y[i]*(.04+.96*g);
+  }return out;
+}
+function normalize(x,target=0.9){let peak=0;for(const v of x)peak=Math.max(peak,Math.abs(v));
+  if(peak>1e-8){const gain=target/peak;for(let i=0;i<x.length;i++)x[i]*=gain;}return x;
+}
+onmessage=e=>{
+  try{
+    const {mode,rate,pcm,valid,gate}=e.data;
+    let x=new Float32Array(pcm),availability=new Uint8Array(valid);
+    if(x.length<512)throw Error('Record at least 0.1 seconds first');
+    if(mode==='heart'){
+      progress('Heart mode: 25–400 Hz band-pass (no speech VAD / hum comb).');
+      x=bandpass(x,rate,25,400,2);
+      x=normalize(x);
+      for(let i=0;i<x.length;i++)if(!availability[i])x[i]=0;
+      postMessage({type:'result',samples:x.buffer,details:'25–400 Hz heart band-pass. Not diagnostic.'},[x.buffer]);return;
+    }
+    progress('Speech: 80 Hz high-pass and adaptive harmonic comb...');
+    x=forwardReverse(x,rate,80,'hp');x=forwardReverse(x,rate,80,'hp');
+    const hum=estimateHum(x,rate);
+    const tones=[];
+    if(hum.freq>0){
+      for(let k=1;k*hum.freq<2500;k++)x=forwardReverse(x,rate,k*hum.freq,'notch',Math.max(15,k*hum.freq/6));
+    }
+    progress('Speech: locating persistent tones...');
+    for(const ft of steadyTones(x,rate)){
+      x=forwardReverse(x,rate,ft,'notch',50);tones.push(Math.round(ft));
+    }
+    x=bandpass(x,rate,100,5500,3);
+    progress('Speech: minimum-statistics Wiener enhancement...');
+    x=stftWiener(x,rate);
+    if(gate){progress('Speech: voice activity detection and smooth gating...');x=voiceGate(x,rate);}
+    x=bandpass(x,rate,90,6000,2);x=normalize(x);
+    for(let i=0;i<x.length;i++)if(!availability[i])x[i]=0;
+    postMessage({type:'result',samples:x.buffer,details:`Estimated hum ${hum.freq.toFixed(2)} Hz; ${tones.length} persistent tones; VAD ${gate?'on':'off'}. Browser approximation of denoise4.py.`},[x.buffer]);
+  }catch(err){postMessage({type:'error',message:err.message||String(err)});}
+};
+
+</script>
 <script>
 'use strict';
 const SERVICE='ee8e0001-7d9d-4f38-85bd-a703a196e710';
@@ -63,6 +277,7 @@ let lastImuUs=0n, lastMicUs=0n;
 const MIC_RATE=16000;
 const LIMIT_PLOT_IMU=1400, LIMIT_PLOT_MIC=1500;
 let micPlotDecimator=0;
+let processingAudio=false;
 const textEncoder=new TextEncoder();
 function log(msg) {
   const stamp=new Date().toLocaleTimeString();
@@ -77,6 +292,8 @@ function refreshButtons() {
   $('imuCsv').disabled=!completed||!imuRows.length;
   $('micCsv').disabled=!completed||!micRows.length;
   $('micWav').disabled=!completed||!micRows.length;
+  $('speechWav').disabled=processingAudio||!completed||!micRows.length;
+  $('heartWav').disabled=processingAudio||!completed||!micRows.length;
   $('connection').textContent=connected?(draining?'Flushing':recording?'Recording':'Online'):'Offline';
 }
 function updateCounters() {
@@ -244,51 +461,64 @@ function makeCsv(kind){
   setTimeout(()=>URL.revokeObjectURL(url),10000);
   log(`Exported ${rows.length.toLocaleString()} ${name.toUpperCase()} rows.`);
 }
-// Export 16-bit PCM mono WAV with nominal 16k samples/s from ADC 12-bit values.
-// Normalize the DC-biased MAX4466 ADC signal and preserve timing when packet gaps exist.
-function makeMicWav(){
-  if(!micRows.length)return;
-  const rate=MIC_RATE;
+// The raw ADC values are retained. Processing acts on a temporary PCM copy.
+function getMicSignal(){
   const firstSeq=micRows[0][1],lastSeq=micRows[micRows.length-1][1];
-  const totalSamples=lastSeq-firstSeq+1;
-  if(!Number.isSafeInteger(totalSamples)||totalSamples<=0||totalSamples>100000000){
-    log('WAV export refused: too many samples.');return;
-  }
-  const missing=totalSamples-micRows.length;
-  // Compute the microphone resting DC bias (generally around mid-ADC).
-  let dc=0;
-  for(const row of micRows)dc+=row[2];
-  dc/=micRows.length;
-  // Find positive/negative peak to use full PCM dynamic range without clipping.
-  let peak=1;
-  for(const row of micRows)peak=Math.max(peak,Math.abs(row[2]-dc));
-  const gain=0.90*32767/peak;
-  const buffer=new ArrayBuffer(44+totalSamples*2);
-  const view=new DataView(buffer);
-  function ascii(offset,str){for(let i=0;i<str.length;i++)view.setUint8(offset+i,str.charCodeAt(i));}
-  ascii(0,'RIFF');view.setUint32(4,36+totalSamples*2,true);
-  ascii(8,'WAVE');ascii(12,'fmt ');
-  view.setUint32(16,16,true); // PCM format chunk length
-  view.setUint16(20,1,true);  // uncompressed PCM
-  view.setUint16(22,1,true);  // 1 channel: mono
-  view.setUint32(24,rate,true);
-  view.setUint32(28,rate*2,true); // byte rate
-  view.setUint16(32,2,true);     // block align
-  view.setUint16(34,16,true);    // bits per sample
-  ascii(36,'data');view.setUint32(40,totalSamples*2,true);
-  // ArrayBuffer is zero-initialized: missing samples become silence instead of shortening time.
-  for(const [,seq,adc] of micRows){
-    const index=seq-firstSeq;
-    const pcm=Math.max(-32768,Math.min(32767,Math.round((adc-dc)*gain)));
-    view.setInt16(44+2*index,pcm,true);
-  }
-  const blob=new Blob([buffer],{type:'audio/wav'});
-  const url=URL.createObjectURL(blob),a=document.createElement('a');
-  a.href=url;
-  a.download=`ESP32C3_mic_${new Date().toISOString().replaceAll(':','-')}.wav`;
-  document.body.append(a);a.click();a.remove();
-  setTimeout(()=>URL.revokeObjectURL(url),10000);
-  log(`WAV saved: ${totalSamples} samples at ${rate} Hz, ${missing} missing samples replaced by silence.`);
+  const n=lastSeq-firstSeq+1;
+  if(!Number.isSafeInteger(n)||n<=0||n>16000000)throw Error('Invalid or overlong recording (max 1000 s)');
+  let dc=0;for(const r of micRows)dc+=r[2];dc/=micRows.length;
+  let peak=1;for(const r of micRows)peak=Math.max(peak,Math.abs(r[2]-dc));
+  const pcm=new Float32Array(n);
+  const valid=new Uint8Array(n);
+  const scale=0.9/peak;
+  for(const [,seq,adc] of micRows){const i=seq-firstSeq;pcm[i]=(adc-dc)*scale;valid[i]=1;}
+  // Missing samples remain silent, rather than shifting later samples in time.
+  return {pcm,valid,missing:n-micRows.length};
+}
+function saveWave(samples,suffix,missing=0){
+  const n=samples.length;
+  if(n*2+44>0xffffffff)throw Error('WAV exceeds RIFF size limit');
+  const buffer=new ArrayBuffer(44+n*2),d=new DataView(buffer);
+  const ascii=(o,t)=>{for(let i=0;i<t.length;i++)d.setUint8(o+i,t.charCodeAt(i));};
+  ascii(0,'RIFF');d.setUint32(4,36+2*n,true);ascii(8,'WAVE');ascii(12,'fmt ');
+  d.setUint32(16,16,true);d.setUint16(20,1,true);d.setUint16(22,1,true);
+  d.setUint32(24,MIC_RATE,true);d.setUint32(28,2*MIC_RATE,true);
+  d.setUint16(32,2,true);d.setUint16(34,16,true);ascii(36,'data');d.setUint32(40,n*2,true);
+  for(let i=0;i<n;i++)d.setInt16(44+2*i,Math.round(Math.max(-1,Math.min(1,samples[i]))*32767),true);
+  const url=URL.createObjectURL(new Blob([buffer],{type:'audio/wav'}));
+  const a=document.createElement('a');a.href=url;
+  a.download=`ESP32C3_${suffix}_${new Date().toISOString().replaceAll(':','-')}.wav`;
+  document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);
+  log(`Saved ${suffix} WAV: ${n} samples, ${missing} unavailable samples represented as silence.`);
+}
+function makeMicWav(){
+  try{const {pcm,missing}=getMicSignal();saveWave(pcm,'mic_raw',missing);}
+  catch(e){log('WAV export error: '+e.message);setStatus(e.message);}
+}
+async function processMicWav(mode){
+  if(processingAudio||!micRows.length)return;
+  processingAudio=true;refreshButtons();
+  $('processing').textContent='Processing '+mode+'... this may take a while for long recordings.';
+  let worker=null;
+  try{
+    const {pcm,valid,missing}=getMicSignal();
+    const src=$('dsp-worker').textContent;
+    const url=URL.createObjectURL(new Blob([src],{type:'application/javascript'}));
+    worker=new Worker(url);URL.revokeObjectURL(url);
+    const result=await new Promise((resolve,reject)=>{
+      worker.onmessage=e=>{
+        const v=e.data;
+        if(v.type==='progress'){$('processing').textContent=v.message;return;}
+        if(v.type==='error')reject(Error(v.message));else if(v.type==='result')resolve(v);
+      };
+      worker.onerror=e=>reject(Error(e.message||'Worker failed'));
+      worker.postMessage({mode,rate:MIC_RATE,pcm:pcm.buffer,valid:valid.buffer,gate:$('speechGate').checked},[pcm.buffer,valid.buffer]);
+    });
+    saveWave(new Float32Array(result.samples),mode==='speech'?'speech_denoised':'heart_filtered',missing);
+    $('processing').textContent=`Done (${mode}). ${result.details||''}`;
+    log('DSP: '+(result.details||mode));
+  }catch(e){$('processing').textContent='Processing failed: '+e.message;log('DSP failed: '+e.message);}
+  finally{if(worker)worker.terminate();processingAudio=false;refreshButtons();}
 }
 // Lightweight canvas plotting without external JS or a network/CDN dependency.
 function draw(canvas,points,channels,yFixed){
@@ -336,6 +566,8 @@ $('stop').onclick=stop;
 $('imuCsv').onclick=()=>makeCsv('imu');
 $('micCsv').onclick=()=>makeCsv('mic');
 $('micWav').onclick=makeMicWav;
+$('speechWav').onclick=()=>processMicWav('speech');
+$('heartWav').onclick=()=>processMicWav('heart');
 $('refresh').onclick=()=>{resetPlots();if(command&&!recording&&!draining)syncClock().catch(e=>log('Clock refresh failed: '+e.message));};
 refreshButtons();render();
 </script></body></html>
