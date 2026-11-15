@@ -17,8 +17,8 @@
                      'R'=status query.
 
   Within each packet, sample j has nominal time firstEpochUs+j*periodUs
-  (500us for MIC, 5000us for IMU). The first sample is timestamped
-  at acquisition. Sampling is best effort, not an ADC/I2C hardware-clocked system.
+  (62.5us for MIC, 5000us for IMU). The first sample is timestamped
+  at acquisition. MIC uses continuous ADC/DMA at 16 kHz; IMU is best-effort 200 Hz.
   Sequence gaps reveal skipped samples or transport losses.
 */
 #include <Arduino.h>
@@ -27,17 +27,20 @@
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <esp_timer.h>
+#include <esp_adc/adc_continuous.h>
+#include <esp_adc/adc_cali.h>
+#include <esp_err.h>
 
 static constexpr uint8_t SDA_PIN = 8, SCL_PIN = 9, MIC_PIN = 0;
-static constexpr uint32_t MIC_PERIOD_US = 500, IMU_PERIOD_US = 5000;
-static constexpr uint16_t MIC_Q_CAP = 512, IMU_Q_CAP = 128;
-static constexpr uint8_t MAX_MIC_BATCH = 40, MAX_IMU_BATCH = 10;
+static constexpr uint32_t MIC_RATE_HZ = 16000, IMU_PERIOD_US = 5000;
+static constexpr uint16_t MIC_Q_CAP = 4096, IMU_Q_CAP = 128;
+static constexpr uint8_t MAX_MIC_BATCH = 108, MAX_IMU_BATCH = 10;
 static constexpr char DEVICE_NAME[] = "C3-IMU-MIC";
 static constexpr char SERVICE_UUID[] = "ee8e0001-7d9d-4f38-85bd-a703a196e710";
 static constexpr char DATA_UUID[]    = "ee8e0002-7d9d-4f38-85bd-a703a196e710";
 static constexpr char COMMAND_UUID[] = "ee8e0003-7d9d-4f38-85bd-a703a196e710";
 
-struct MicSample { uint64_t timeUs; uint32_t seq; uint16_t adc; };
+struct MicSample { uint32_t seq; uint16_t adc; };
 struct ImuSample { uint64_t timeUs; uint32_t seq; int16_t v[6]; };
 static MicSample micQ[MIC_Q_CAP];
 static ImuSample imuQ[IMU_Q_CAP];
@@ -52,6 +55,12 @@ static volatile uint16_t negotiatedMtu=23;
 static uint64_t syncedEpochUs=0, syncedBootUs=0;
 static bool hasClock=false, pendingStatus=false;
 static bool sendingStopped=false;
+static adc_continuous_handle_t adcHandle=nullptr;
+static adc_unit_t adcUnit;
+static adc_channel_t adcChannel;
+static volatile bool micTaskActive=false, imuTaskActive=false;
+static volatile bool adcError=false;
+static uint64_t micStartBootUs=0;
 static Adafruit_MPU6050 mpu;
 static NimBLEServer* server=nullptr;
 static NimBLECharacteristic* dataChar=nullptr;
@@ -72,7 +81,7 @@ static inline int16_t clampI16(float x) {
   return (int16_t)lroundf(x);
 }
 static uint64_t epochFromBoot(uint64_t bootUs) {
-  // Written once from command callback; no overflow for normal session lengths.
+  // Synced at session start. 64-bit microsecond timestamps.
   return syncedEpochUs + (bootUs - syncedBootUs);
 }
 
@@ -91,7 +100,7 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
 class CommandCallbacks final : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* ch, NimBLEConnInfo&) override {
     const auto value=ch->getValue();
-    if(value.empty()) return;
+    if(value.size() == 0) return;
     const uint8_t* p=(const uint8_t*)value.data();
     if(p[0]=='T' && value.size()==9) {
       const uint64_t epochMs=get64(p+1);
@@ -122,47 +131,108 @@ static void pushImu(const ImuSample& s) {
   portEXIT_CRITICAL(&mux);
 }
 
-static void sensorTask(void*) {
-  uint64_t nextMic=0, nextImu=0;
-  bool wasSampling=false;
-  while(true) {
-    if(!sampling) { wasSampling=false; vTaskDelay(pdMS_TO_TICKS(2)); continue; }
-    uint64_t now=(uint64_t)esp_timer_get_time();
-    if(!wasSampling) { nextMic=now; nextImu=now; wasSampling=true; }
-
-    // IMU first: a 400kHz I2C burst can delay an ADC sample.
-    if(now>=nextImu) {
-      const uint32_t missed=(uint32_t)((now-nextImu)/IMU_PERIOD_US);
-      imuSeq+=missed; nextImu+=(uint64_t)(missed+1)*IMU_PERIOD_US;
-      sensors_event_t a,g,temp;
-      mpu.getEvent(&a,&g,&temp);
-      ImuSample s{};
-      s.timeUs=(uint64_t)esp_timer_get_time();
-      s.seq=imuSeq++;
-      constexpr float ACC=16384.0f/9.80665f;
-      constexpr float GYR=131.0f*180.0f/PI;
-      s.v[0]=clampI16(a.acceleration.x*ACC);
-      s.v[1]=clampI16(a.acceleration.y*ACC);
-      s.v[2]=clampI16(a.acceleration.z*ACC);
-      s.v[3]=clampI16(g.gyro.x*GYR);
-      s.v[4]=clampI16(g.gyro.y*GYR);
-      s.v[5]=clampI16(g.gyro.z*GYR);
-      pushImu(s);
-      now=(uint64_t)esp_timer_get_time();
+// ADC continuous mode uses the ESP32-C3 hardware ADC controller + DMA.
+// ADC sample sequence numbers represent uniformly spaced 16 kHz sample slots.
+// A DMA overrun (ESP_ERR_INVALID_STATE) cannot be reconstructed precisely;
+// flag it as an error. Application queue overflows are counted separately.
+static void micTask(void*) {
+  alignas(4) uint8_t bytes[512];
+  bool running=false;
+  uint32_t seq=0;
+  for (;;) {
+    if (!sampling) {
+      if (running) {
+        // Drain any final completed DMA samples before stopping the converter.
+        uint32_t n=0;
+        for (int frame=0;frame<8 && adc_continuous_read(adcHandle, bytes, sizeof(bytes), &n, 0)==ESP_OK && n;frame++) {
+          for (uint32_t off=0;off+SOC_ADC_DIGI_RESULT_BYTES<=n;off+=SOC_ADC_DIGI_RESULT_BYTES) {
+            const adc_digi_output_data_t* v=(const adc_digi_output_data_t*)(bytes+off);
+            if (v->type2.channel==adcChannel) pushMic({seq++, (uint16_t)v->type2.data});
+          }
+        }
+        adc_continuous_stop(adcHandle);
+        micTaskActive=false;
+        running=false;
+      }
+      vTaskDelay(pdMS_TO_TICKS(1));
+      continue;
     }
-    if(now>=nextMic) {
-      const uint32_t missed=(uint32_t)((now-nextMic)/MIC_PERIOD_US);
-      micSeq+=missed; nextMic+=(uint64_t)(missed+1)*MIC_PERIOD_US;
-      MicSample s{};
-      s.adc=(uint16_t)analogRead(MIC_PIN);
-      s.timeUs=(uint64_t)esp_timer_get_time();
-      s.seq=micSeq++;
-      pushMic(s);
+    if (!running) {
+      seq=0;
+      micStartBootUs=(uint64_t)esp_timer_get_time();
+      if (adc_continuous_start(adcHandle)!=ESP_OK) {
+        adcError=true; sampling=false; continue;
+      }
+      running=true;
+      micTaskActive=true;
     }
-    // Keep ADC scheduling fine-grained while the BLE/OS higher-priority
-    // tasks remain able to preempt this task. This is CPU-intensive.
-    delayMicroseconds(40);
+    uint32_t n=0;
+    esp_err_t err=adc_continuous_read(adcHandle, bytes, sizeof(bytes), &n, 10);
+    if (err==ESP_OK) {
+      for (uint32_t off=0;off+SOC_ADC_DIGI_RESULT_BYTES<=n;off+=SOC_ADC_DIGI_RESULT_BYTES) {
+        const adc_digi_output_data_t* v=(const adc_digi_output_data_t*)(bytes+off);
+        if(v->type2.channel==adcChannel) pushMic({seq++, (uint16_t)v->type2.data});
+      }
+    } else if (err!=ESP_ERR_TIMEOUT) {
+      adcError=true;
+      // Do not silently claim lossless capture on driver errors.
+      Serial.printf("ADC DMA read error: %s\n", esp_err_to_name(err));
+      sampling=false;
+    }
   }
+}
+
+// MPU6050 independently acquired at nominal 200 Hz; IMU scheduling jitter
+// remains possible, and missed deadlines are represented as sequence gaps.
+static void imuTask(void*) {
+  uint64_t nextImu=0;
+  bool active=false;
+  for (;;) {
+    if (!sampling) {
+      active=false; imuTaskActive=false;
+      vTaskDelay(pdMS_TO_TICKS(1)); continue;
+    }
+    uint64_t now=(uint64_t)esp_timer_get_time();
+    if (!active) { nextImu=now; active=true; imuTaskActive=true; }
+    if (now<nextImu) { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+    uint32_t missed=(uint32_t)((now-nextImu)/IMU_PERIOD_US);
+    imuSeq+=missed;
+    nextImu+=(uint64_t)(missed+1)*IMU_PERIOD_US;
+    sensors_event_t a,g,temp;
+    mpu.getEvent(&a,&g,&temp);
+    ImuSample s{};
+    s.timeUs=(uint64_t)esp_timer_get_time();
+    s.seq=imuSeq++;
+    constexpr float ACC=16384.0f/9.80665f;
+    constexpr float GYR=131.0f*180.0f/PI;
+    s.v[0]=clampI16(a.acceleration.x*ACC);
+    s.v[1]=clampI16(a.acceleration.y*ACC);
+    s.v[2]=clampI16(a.acceleration.z*ACC);
+    s.v[3]=clampI16(g.gyro.x*GYR);
+    s.v[4]=clampI16(g.gyro.y*GYR);
+    s.v[5]=clampI16(g.gyro.z*GYR);
+    pushImu(s);
+  }
+}
+
+static bool initializeAdc() {
+  if (adc_continuous_io_to_channel(MIC_PIN,&adcUnit,&adcChannel)!=ESP_OK || adcUnit!=ADC_UNIT_1) return false;
+  adc_continuous_handle_cfg_t hcfg={};
+  hcfg.max_store_buf_size=4096;
+  hcfg.conv_frame_size=256;
+  if(adc_continuous_new_handle(&hcfg,&adcHandle)!=ESP_OK) return false;
+  static adc_digi_pattern_config_t pattern[1]={};
+  pattern[0].atten=ADC_ATTEN_DB_12;
+  pattern[0].channel=(uint8_t)adcChannel;
+  pattern[0].unit=(uint8_t)adcUnit;
+  pattern[0].bit_width=ADC_BITWIDTH_12;
+  adc_continuous_config_t cfg={};
+  cfg.sample_freq_hz=MIC_RATE_HZ;
+  cfg.conv_mode=ADC_CONV_SINGLE_UNIT_1;
+  cfg.format=ADC_DIGI_OUTPUT_FORMAT_TYPE2;
+  cfg.pattern_num=1;
+  cfg.adc_pattern=pattern;
+  return adc_continuous_config(adcHandle,&cfg)==ESP_OK;
 }
 
 static bool sendStatus(uint8_t code) {
@@ -198,7 +268,7 @@ static bool sendMicBatch() {
   uint8_t pkt[16+2*MAX_MIC_BATCH];
   pkt[0]='M';pkt[1]=1;pkt[2]=n;pkt[3]=0;
   put32(pkt+4,batch[0].seq);
-  put64(pkt+8,epochFromBoot(batch[0].timeUs));
+  put64(pkt+8,epochFromBoot(micStartBootUs + ((uint64_t)batch[0].seq*1000000ULL)/MIC_RATE_HZ));
   for(uint8_t j=0;j<n;j++) put16(pkt+16+2*j,batch[j].adc);
   if(!dataChar->notify(pkt,16+2*n)) return false;
   portENTER_CRITICAL(&mux);
@@ -239,8 +309,10 @@ static bool sendImuBatch() {
 
 void setup() {
   Serial.begin(115200);
-  analogReadResolution(12);
-  analogSetPinAttenuation(MIC_PIN,ADC_11db);
+  if(!initializeAdc()) {
+    Serial.println("ADC DMA initialization failed. Check ESP32 Arduino core 3.x.");
+    while(true) delay(2000);
+  }
   Wire.begin(SDA_PIN,SCL_PIN,400000);
   if(!mpu.begin(0x68,&Wire)) {
     Serial.println("MPU6050 not found at 0x68. Check power/SDA/SCL.");
@@ -261,11 +333,14 @@ void setup() {
   cmd->setCallbacks(new CommandCallbacks());
   svc->start();
   NimBLEAdvertising* adv=NimBLEDevice::getAdvertising();
+  adv->enableScanResponse(true);
   adv->addServiceUUID(SERVICE_UUID);
   adv->setName(DEVICE_NAME);
-  adv->start();
-  xTaskCreate(sensorTask,"acquisition",8192,nullptr,2,nullptr);
-  Serial.println("BLE ready: C3-IMU-MIC");
+  bool advertisingOK=adv->start();
+  Serial.printf("BLE advertising: %s\n",advertisingOK?"YES":"NO");
+  xTaskCreate(micTask,"adc_dma",4096,nullptr,3,nullptr);
+  xTaskCreate(imuTask,"imu_200hz",4096,nullptr,2,nullptr);
+  Serial.println("BLE ready: C3-IMU-MIC | MIC DMA 16000 Hz | IMU 200 Hz");
 }
 
 void loop() {
@@ -273,8 +348,7 @@ void loop() {
   if(cmd) pendingCommand=0;
   if(cmd=='B') {
     sampling=false;
-    // Allow prior acquisition iteration to finish before resetting its queues.
-    delay(8);
+    while(micTaskActive || imuTaskActive) delay(1);
     uint16_t mtu=negotiatedMtu;
     if(!connected || !hasClock || mtu<31) {
       sendStatus(3);
@@ -283,14 +357,14 @@ void loop() {
       micHead=micTail=micCount=imuHead=imuTail=imuCount=0;
       micSeq=imuSeq=dropMic=dropImu=0;
       portEXIT_CRITICAL(&mux);
-      sendingStopped=false; stopRequested=false;
+      sendingStopped=false; stopRequested=false; adcError=false;
       sampling=true;
       sendStatus(1);
     }
   } else if(cmd=='E') {
     sampling=false; stopRequested=true;
-    // Sensor task may still be finishing its current cycle.
-    delay(8);
+    // Let ADC task drain the final DMA frame before declaring capture complete.
+    while(micTaskActive || imuTaskActive) delay(1);
   } else if(cmd=='R') {
     pendingStatus=true;
   }
@@ -310,9 +384,9 @@ void loop() {
   if(stopRequested && !sendingStopped) {
     uint16_t m,i;
     portENTER_CRITICAL(&mux); m=micCount; i=imuCount; portEXIT_CRITICAL(&mux);
-    if(!m && !i && sendStatus(2)) {
+    if(!m && !i && sendStatus(adcError?3:2)) {
       stopRequested=false; sendingStopped=true;
     }
   }
-  delay(didWork?1:3);
+  delay(didWork?0:1);
 }

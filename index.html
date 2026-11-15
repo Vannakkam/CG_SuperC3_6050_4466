@@ -27,7 +27,7 @@ footer {font-size:13px;color:var(--muted);margin-top:18px}
 </head>
 <body><main>
 <h1>ESP32-C3 Sensor Recorder</h1>
-<p>MPU6050 · 200 Hz &nbsp; | &nbsp; MAX4466 · 2000 Hz &nbsp; | &nbsp; Web Bluetooth</p>
+<p>MPU6050 · 200 Hz &nbsp; | &nbsp; MAX4466 · 16,000 Hz (ADC DMA) &nbsp; | &nbsp; Web Bluetooth</p>
 <div id="status" role="status">Disconnected. Pair to begin.</div>
 <div class="controls">
   <button class="primary" id="pair">1. Pair / Connect</button>
@@ -35,6 +35,7 @@ footer {font-size:13px;color:var(--muted);margin-top:18px}
   <button class="stop" id="stop" disabled>3. Stop Recording</button>
   <button id="imuCsv" disabled>4. Download IMU CSV</button>
   <button id="micCsv" disabled>Download Mic CSV</button>
+  <button id="micWav" disabled>Download Mic WAV</button>
   <button id="refresh">5. Refresh Data</button>
 </div>
 <div class="metrics">
@@ -46,7 +47,7 @@ footer {font-size:13px;color:var(--muted);margin-top:18px}
 <section class="panel"><h2>Accelerometer (g)</h2><div class="legend">X: blue &nbsp; Y: green &nbsp; Z: pink · rolling 6-second window</div><canvas id="imuPlot"></canvas></section>
 <section class="panel"><h2>Microphone (raw ADC counts)</h2><div class="legend">0–4095, 12-bit · rolling 6-second window (plot decimated; CSV full rate)</div><canvas id="micPlot"></canvas></section>
 <section class="panel"><h2>Event log</h2><div id="log" aria-live="polite">Waiting for connection…</div></section>
-<footer>* Sequence gaps include sampling deadlines missed on the ESP32 and BLE packets missing at the browser. Device ring-buffer overflows are reported separately in the event log. Data is stored in browser memory until exported; refresh only clears plots, not stored samples. Browser time sync is approximate because BLE write latency is variable. No persistent storage or retransmission on the ESP32.</footer>
+<footer>* Sequence gaps include sampling deadlines missed on the ESP32 and BLE packets missing at the browser. Device ring-buffer overflows are reported separately in the event log. WAV is 16-bit PCM mono at the nominal 16,000 Hz rate, with missing sequence samples filled with silence; refresh only clears plots, not stored samples. Browser time sync is approximate because BLE write latency is variable. No persistent storage or retransmission on the ESP32.</footer>
 </main>
 <script>
 'use strict';
@@ -59,7 +60,9 @@ let recording=false, draining=false, completed=false, connectionBusy=false;
 let imuRows=[], micRows=[], imuPlot=[], micPlot=[];
 let expectedImu=null, expectedMic=null, gapCount=0, stopTimeout=null;
 let lastImuUs=0n, lastMicUs=0n;
+const MIC_RATE=16000;
 const LIMIT_PLOT_IMU=1400, LIMIT_PLOT_MIC=1500;
+let micPlotDecimator=0;
 const textEncoder=new TextEncoder();
 function log(msg) {
   const stamp=new Date().toLocaleTimeString();
@@ -73,6 +76,7 @@ function refreshButtons() {
   $('stop').disabled=!connected||!recording||draining;
   $('imuCsv').disabled=!completed||!imuRows.length;
   $('micCsv').disabled=!completed||!micRows.length;
+  $('micWav').disabled=!completed||!micRows.length;
   $('connection').textContent=connected?(draining?'Flushing':recording?'Recording':'Online'):'Offline';
 }
 function updateCounters() {
@@ -82,7 +86,7 @@ function updateCounters() {
 }
 function resetRecording() {
   imuRows=[];micRows=[];imuPlot=[];micPlot=[];
-  expectedImu=null;expectedMic=null;gapCount=0;lastImuUs=0n;lastMicUs=0n;
+  expectedImu=null;expectedMic=null;gapCount=0;lastImuUs=0n;lastMicUs=0n;micPlotDecimator=0;
   completed=false;updateCounters();refreshButtons();
 }
 function resetPlots() {imuPlot=[];micPlot=[];log('Live plots refreshed; CSV buffers preserved.');}
@@ -143,9 +147,9 @@ function receive(event) {
     showGap('MIC',expectedMic,seq);
     if(expectedMic!==null&&seq<expectedMic){log('MIC out-of-order/duplicate packet ignored');return;}
     for(let j=0;j<count;j++){
-      const t=epochUs+BigInt(j*500),adc=dv.getUint16(16+j*2,true);
+      const t=epochUs+BigInt(j*125)/2n,adc=dv.getUint16(16+j*2,true);
       micRows.push([t,seq+j,adc]);
-      if(j%4===0)micPlot.push([Number(t/1000n),adc]);
+      if((micPlotDecimator++ % 64)===0)micPlot.push([Number(t/1000n),adc]);
       lastMicUs=t;
     }
     expectedMic=seq+count;
@@ -166,7 +170,7 @@ async function pair(){
   if(!navigator.bluetooth){setStatus('Web Bluetooth unavailable: use Chrome/Edge on a supported device over HTTPS or localhost.');return;}
   connectionBusy=true;refreshButtons();
   try{
-    device = await navigator.bluetooth.requestDevice({acceptAllDevices: true,optionalServices: [SERVICE]});
+    device=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:[SERVICE]});
     device.addEventListener('gattserverdisconnected',onDisconnected);
     server=await device.gatt.connect();
     const svc=await server.getPrimaryService(SERVICE);
@@ -240,6 +244,52 @@ function makeCsv(kind){
   setTimeout(()=>URL.revokeObjectURL(url),10000);
   log(`Exported ${rows.length.toLocaleString()} ${name.toUpperCase()} rows.`);
 }
+// Export 16-bit PCM mono WAV with nominal 16k samples/s from ADC 12-bit values.
+// Normalize the DC-biased MAX4466 ADC signal and preserve timing when packet gaps exist.
+function makeMicWav(){
+  if(!micRows.length)return;
+  const rate=MIC_RATE;
+  const firstSeq=micRows[0][1],lastSeq=micRows[micRows.length-1][1];
+  const totalSamples=lastSeq-firstSeq+1;
+  if(!Number.isSafeInteger(totalSamples)||totalSamples<=0||totalSamples>100000000){
+    log('WAV export refused: too many samples.');return;
+  }
+  const missing=totalSamples-micRows.length;
+  // Compute the microphone resting DC bias (generally around mid-ADC).
+  let dc=0;
+  for(const row of micRows)dc+=row[2];
+  dc/=micRows.length;
+  // Find positive/negative peak to use full PCM dynamic range without clipping.
+  let peak=1;
+  for(const row of micRows)peak=Math.max(peak,Math.abs(row[2]-dc));
+  const gain=0.90*32767/peak;
+  const buffer=new ArrayBuffer(44+totalSamples*2);
+  const view=new DataView(buffer);
+  function ascii(offset,str){for(let i=0;i<str.length;i++)view.setUint8(offset+i,str.charCodeAt(i));}
+  ascii(0,'RIFF');view.setUint32(4,36+totalSamples*2,true);
+  ascii(8,'WAVE');ascii(12,'fmt ');
+  view.setUint32(16,16,true); // PCM format chunk length
+  view.setUint16(20,1,true);  // uncompressed PCM
+  view.setUint16(22,1,true);  // 1 channel: mono
+  view.setUint32(24,rate,true);
+  view.setUint32(28,rate*2,true); // byte rate
+  view.setUint16(32,2,true);     // block align
+  view.setUint16(34,16,true);    // bits per sample
+  ascii(36,'data');view.setUint32(40,totalSamples*2,true);
+  // ArrayBuffer is zero-initialized: missing samples become silence instead of shortening time.
+  for(const [,seq,adc] of micRows){
+    const index=seq-firstSeq;
+    const pcm=Math.max(-32768,Math.min(32767,Math.round((adc-dc)*gain)));
+    view.setInt16(44+2*index,pcm,true);
+  }
+  const blob=new Blob([buffer],{type:'audio/wav'});
+  const url=URL.createObjectURL(blob),a=document.createElement('a');
+  a.href=url;
+  a.download=`ESP32C3_mic_${new Date().toISOString().replaceAll(':','-')}.wav`;
+  document.body.append(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),10000);
+  log(`WAV saved: ${totalSamples} samples at ${rate} Hz, ${missing} missing samples replaced by silence.`);
+}
 // Lightweight canvas plotting without external JS or a network/CDN dependency.
 function draw(canvas,points,channels,yFixed){
   const dpr=Math.max(1,window.devicePixelRatio||1),width=canvas.clientWidth,height=canvas.clientHeight;
@@ -285,6 +335,7 @@ $('start').onclick=begin;
 $('stop').onclick=stop;
 $('imuCsv').onclick=()=>makeCsv('imu');
 $('micCsv').onclick=()=>makeCsv('mic');
+$('micWav').onclick=makeMicWav;
 $('refresh').onclick=()=>{resetPlots();if(command&&!recording&&!draining)syncClock().catch(e=>log('Clock refresh failed: '+e.message));};
 refreshButtons();render();
 </script></body></html>
