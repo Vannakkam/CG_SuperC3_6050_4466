@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-C3 | IMU + Mic BLE Logger</title>
+<style>
+:root { color-scheme:dark; --bg:#0b1220; --panel:#151e30; --line:#30405b; --text:#e5edf9; --muted:#9daec4; --blue:#70b8ff; --teal:#43dab0; --red:#ff7189; --yellow:#ffcb75; }
+* { box-sizing:border-box; } body {margin:0;background:var(--bg);color:var(--text);font-family:system-ui,Arial,sans-serif;line-height:1.4}
+main {max-width:1180px;margin:0 auto;padding:25px 16px 40px}
+h1 {font-size:clamp(23px,3.7vw,35px);margin:0 0 7px;letter-spacing:-.8px} p {color:var(--muted)}
+.controls {display:flex;flex-wrap:wrap;gap:10px;margin:20px 0}
+button {cursor:pointer;border:1px solid var(--line);border-radius:10px;color:var(--text);background:#24344e;font-weight:650;padding:11px 16px}
+button.primary {background:#1670c5;border-color:#228af3} button.stop {background:#8b3f57;border-color:#ba5871}
+button:hover:not(:disabled) {filter:brightness(1.13)}button:disabled {opacity:.38;cursor:not-allowed}
+.metrics {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.metric,.panel {background:var(--panel);border:1px solid #25344d;border-radius:14px;padding:15px}
+.metric span {display:block;color:var(--muted);font-size:12px;letter-spacing:.3px;text-transform:uppercase}
+.metric strong {display:block;font-size:24px;margin-top:6px;font-variant-numeric:tabular-nums}
+.panel {margin-top:14px} .panel h2 {font-size:17px;margin:0 0 7px}.legend {color:var(--muted);font-size:12px;margin-bottom:10px}
+canvas {width:100%;height:225px;display:block;background:#0c1525;border-radius:8px}
+#status {padding:11px 14px;border:1px solid #354762;border-radius:10px;background:#1c2a40;color:#bcd3ed;min-height:46px}
+#log {font-family:ui-monospace,monospace;white-space:pre-wrap;font-size:12px;color:#b5c5d8;max-height:115px;overflow:auto}
+footer {font-size:13px;color:var(--muted);margin-top:18px}
+@media (max-width:680px) {.metrics {grid-template-columns:repeat(2,minmax(0,1fr))}button {flex:1 1 135px} canvas {height:190px}}
+</style>
+</head>
+<body><main>
+<h1>ESP32-C3 Sensor Recorder</h1>
+<p>MPU6050 · 200 Hz &nbsp; | &nbsp; MAX4466 · 2000 Hz &nbsp; | &nbsp; Web Bluetooth</p>
+<div id="status" role="status">Disconnected. Pair to begin.</div>
+<div class="controls">
+  <button class="primary" id="pair">1. Pair / Connect</button>
+  <button id="start" disabled>2. Start Recording</button>
+  <button class="stop" id="stop" disabled>3. Stop Recording</button>
+  <button id="imuCsv" disabled>4. Download IMU CSV</button>
+  <button id="micCsv" disabled>Download Mic CSV</button>
+  <button id="refresh">5. Refresh Data</button>
+</div>
+<div class="metrics">
+  <div class="metric"><span>Connection</span><strong id="connection">Offline</strong></div>
+  <div class="metric"><span>IMU samples</span><strong id="imuN">0</strong></div>
+  <div class="metric"><span>Mic samples</span><strong id="micN">0</strong></div>
+  <div class="metric"><span>Sequence gaps*</span><strong id="missing">0</strong></div>
+</div>
+<section class="panel"><h2>Accelerometer (g)</h2><div class="legend">X: blue &nbsp; Y: green &nbsp; Z: pink · rolling 6-second window</div><canvas id="imuPlot"></canvas></section>
+<section class="panel"><h2>Microphone (raw ADC counts)</h2><div class="legend">0–4095, 12-bit · rolling 6-second window (plot decimated; CSV full rate)</div><canvas id="micPlot"></canvas></section>
+<section class="panel"><h2>Event log</h2><div id="log" aria-live="polite">Waiting for connection…</div></section>
+<footer>* Sequence gaps include sampling deadlines missed on the ESP32 and BLE packets missing at the browser. Device ring-buffer overflows are reported separately in the event log. Data is stored in browser memory until exported; refresh only clears plots, not stored samples. Browser time sync is approximate because BLE write latency is variable. No persistent storage or retransmission on the ESP32.</footer>
+</main>
+<script>
+'use strict';
+const SERVICE='ee8e0001-7d9d-4f38-85bd-a703a196e710';
+const DATA='ee8e0002-7d9d-4f38-85bd-a703a196e710';
+const CMD='ee8e0003-7d9d-4f38-85bd-a703a196e710';
+const $=id=>document.getElementById(id);
+let device=null, server=null, command=null, dataChar=null;
+let recording=false, draining=false, completed=false, connectionBusy=false;
+let imuRows=[], micRows=[], imuPlot=[], micPlot=[];
+let expectedImu=null, expectedMic=null, gapCount=0, stopTimeout=null;
+let lastImuUs=0n, lastMicUs=0n;
+const LIMIT_PLOT_IMU=1400, LIMIT_PLOT_MIC=1500;
+const textEncoder=new TextEncoder();
+function log(msg) {
+  const stamp=new Date().toLocaleTimeString();
+  $('log').textContent=`[${stamp}] ${msg}\n`+$('log').textContent.slice(0,5000);
+}
+function setStatus(msg){$('status').textContent=msg;}
+function refreshButtons() {
+  const connected=!!(device?.gatt?.connected && command && dataChar);
+  $('pair').disabled=connectionBusy||connected;
+  $('start').disabled=!connected||recording||draining;
+  $('stop').disabled=!connected||!recording||draining;
+  $('imuCsv').disabled=!completed||!imuRows.length;
+  $('micCsv').disabled=!completed||!micRows.length;
+  $('connection').textContent=connected?(draining?'Flushing':recording?'Recording':'Online'):'Offline';
+}
+function updateCounters() {
+  $('imuN').textContent=imuRows.length.toLocaleString();
+  $('micN').textContent=micRows.length.toLocaleString();
+  $('missing').textContent=gapCount.toLocaleString();
+}
+function resetRecording() {
+  imuRows=[];micRows=[];imuPlot=[];micPlot=[];
+  expectedImu=null;expectedMic=null;gapCount=0;lastImuUs=0n;lastMicUs=0n;
+  completed=false;updateCounters();refreshButtons();
+}
+function resetPlots() {imuPlot=[];micPlot=[];log('Live plots refreshed; CSV buffers preserved.');}
+function readU64(view,offset) {
+  if(view.getBigUint64) return view.getBigUint64(offset,true);
+  return BigInt(view.getUint32(offset,true))+(BigInt(view.getUint32(offset+4,true))<<32n);
+}
+function showGap(kind,expect,actual) {
+  if(expect!==null && actual>expect) {
+    const miss=actual-expect;
+    gapCount+=miss;
+    if(gapCount<100 || miss>20) log(`${kind} sequence gap: ${miss} missing samples`);
+  }
+}
+function receive(event) {
+  // Copy the DataView because Chromium may reuse the backing notification buffer.
+  const data=event.target.value;
+  const dv=new DataView(data.buffer,data.byteOffset,data.byteLength);
+  if(dv.byteLength<2) return;
+  const type=String.fromCharCode(dv.getUint8(0));
+  if(type==='S') {
+    if(dv.byteLength<12)return;
+    const code=dv.getUint8(1), mtu=dv.getUint16(2,true);
+    const mDrops=dv.getUint32(4,true),iDrops=dv.getUint32(8,true);
+    if(code===1){log(`Recording started. BLE MTU ${mtu}.`);setStatus('Recording IMU and microphone…');}
+    else if(code===2){
+      log(`Recording finished. ESP32 buffer drops: MIC ${mDrops}, IMU ${iDrops}.`);
+      if(stopTimeout)clearTimeout(stopTimeout);
+      recording=false;draining=false;completed=true;
+      setStatus(`Stopped. Save both CSV files. Device buffer drops: MIC ${mDrops}; IMU ${iDrops}.`);
+      refreshButtons();
+    } else if(code===3){
+      log(`Start failed: clock not synchronized, disconnected, or MTU ${mtu} too small (need >=31).`);
+      recording=false;draining=false;setStatus(`Cannot record (MTU ${mtu}). Reconnect or use another BLE adapter.`);refreshButtons();
+    }
+    return;
+  }
+  if(type!=='I'&&type!=='M')return;
+  if(dv.byteLength<16||dv.getUint8(1)!==1)return;
+  const count=dv.getUint8(2),step=type==='I'?12:2;
+  if(dv.byteLength!==16+count*step){log(`Invalid ${type} packet length`);return;}
+  let seq=dv.getUint32(4,true), epochUs=readU64(dv,8);
+  // The device supplies timestamp of first sample; subsequent timestamps use nominal periods.
+  if(type==='I'){
+    showGap('IMU',expectedImu,seq);
+    if(expectedImu!==null && seq<expectedImu){log('IMU out-of-order/duplicate packet ignored');return;}
+    for(let j=0;j<count;j++) {
+      const o=16+j*12,t=epochUs+BigInt(j*5000);
+      const ax=dv.getInt16(o,true)/16384,ay=dv.getInt16(o+2,true)/16384,az=dv.getInt16(o+4,true)/16384;
+      const gx=dv.getInt16(o+6,true)/131,gy=dv.getInt16(o+8,true)/131,gz=dv.getInt16(o+10,true)/131;
+      imuRows.push([t,seq+j,ax,ay,az,gx,gy,gz]);
+      imuPlot.push([Number(t/1000n),ax,ay,az]);
+      lastImuUs=t;
+    }
+    expectedImu=seq+count;
+    if(imuPlot.length>LIMIT_PLOT_IMU)imuPlot.splice(0,imuPlot.length-LIMIT_PLOT_IMU);
+  } else {
+    showGap('MIC',expectedMic,seq);
+    if(expectedMic!==null&&seq<expectedMic){log('MIC out-of-order/duplicate packet ignored');return;}
+    for(let j=0;j<count;j++){
+      const t=epochUs+BigInt(j*500),adc=dv.getUint16(16+j*2,true);
+      micRows.push([t,seq+j,adc]);
+      if(j%4===0)micPlot.push([Number(t/1000n),adc]);
+      lastMicUs=t;
+    }
+    expectedMic=seq+count;
+    if(micPlot.length>LIMIT_PLOT_MIC)micPlot.splice(0,micPlot.length-LIMIT_PLOT_MIC);
+  }
+}
+async function sendCommand(bytes){
+  if(!command)throw Error('Not connected');
+  await command.writeValueWithResponse(new Uint8Array(bytes));
+}
+async function syncClock() {
+  const bytes=new Uint8Array(9);bytes[0]='T'.charCodeAt(0);
+  new DataView(bytes.buffer).setBigUint64(1,BigInt(Date.now()),true);
+  await sendCommand(bytes);
+  log('ESP32 clock synchronized to the browser system clock (approximate).');
+}
+async function pair(){
+  if(!navigator.bluetooth){setStatus('Web Bluetooth unavailable: use Chrome/Edge on a supported device over HTTPS or localhost.');return;}
+  connectionBusy=true;refreshButtons();
+  try{
+    device=await navigator.bluetooth.requestDevice({filters:[{name:'C3-IMU-MIC'}],optionalServices:[SERVICE]});
+    device.addEventListener('gattserverdisconnected',onDisconnected);
+    server=await device.gatt.connect();
+    const svc=await server.getPrimaryService(SERVICE);
+    dataChar=await svc.getCharacteristic(DATA);
+    command=await svc.getCharacteristic(CMD);
+    dataChar.addEventListener('characteristicvaluechanged',receive);
+    await dataChar.startNotifications();
+    await syncClock();
+    log('Connected to '+device.name+'.');
+    setStatus('Connected. Press Start Recording.');
+  } catch(error){
+    log('Connect failed: '+error.message);setStatus('Connection failed: '+error.message);
+    dataChar=null;command=null;
+  } finally {connectionBusy=false;refreshButtons();}
+}
+function onDisconnected(){
+  log('BLE disconnected. Any buffered data remains available in this page.');
+  if(recording||draining){
+    recording=false;draining=false;completed=imuRows.length>0||micRows.length>0;
+    setStatus('Disconnected during acquisition. Partial data can be exported; inspect sequence gaps.');
+  } else setStatus('Disconnected. Reconnect to start another recording.');
+  dataChar=null;command=null;refreshButtons();
+}
+async function begin() {
+  if(!command)return;
+  try{
+    resetRecording();
+    await syncClock();
+    await sendCommand([...'B'].map(c=>c.charCodeAt(0)));
+    recording=true;setStatus('Start command sent. Acquiring…');refreshButtons();
+  } catch(e){log('Start failed: '+e.message);recording=false;refreshButtons();}
+}
+async function stop(){
+  if(!recording||draining)return;
+  try{
+    draining=true;refreshButtons();setStatus('Stopping: receiving remaining BLE packets…');
+    await sendCommand([69]);
+    stopTimeout=setTimeout(()=>{
+      if(draining){
+        draining=false;recording=false;completed=imuRows.length>0||micRows.length>0;
+        log('Stop timeout: no completion packet. Export may be incomplete.');
+        setStatus('Flush timeout. Partial CSV export enabled.');refreshButtons();
+      }
+    },20000);
+  }catch(e){draining=false;log('Stop command failed: '+e.message);refreshButtons();}
+}
+function isoUs(t){
+  // ISO UTC with all 6 fractional-second digits.
+  const sec=t/1000000n, us=t%1000000n;
+  return new Date(Number(sec*1000n)).toISOString().slice(0,19)+'.'+us.toString().padStart(6,'0')+'Z';
+}
+function makeCsv(kind){
+  const rows=kind==='imu'?imuRows:micRows;
+  if(!rows.length)return;
+  const header=kind==='imu'?'timestamp_utc,epoch_us,seq,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps\n':'timestamp_utc,epoch_us,seq,mic_adc_raw\n';
+  const parts=[header];
+  // Chunk to avoid one enormous temporary string; still stored fully in RAM.
+  const CHUNK=3000;
+  for(let i=0;i<rows.length;i+=CHUNK){
+    let output='';
+    for(let j=i;j<Math.min(rows.length,i+CHUNK);j++) {
+      const [t,...v]=rows[j];output+=isoUs(t)+','+t.toString()+','+v.join(',')+'\n';
+    }
+    parts.push(output);
+  }
+  const blob=new Blob(parts,{type:'text/csv;charset=utf-8'});
+  const url=URL.createObjectURL(blob),a=document.createElement('a');
+  const name=kind==='imu'?'imu':'mic';
+  a.href=url;a.download=`ESP32C3_${name}_${new Date().toISOString().replaceAll(':','-')}.csv`;
+  document.body.append(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),10000);
+  log(`Exported ${rows.length.toLocaleString()} ${name.toUpperCase()} rows.`);
+}
+// Lightweight canvas plotting without external JS or a network/CDN dependency.
+function draw(canvas,points,channels,yFixed){
+  const dpr=Math.max(1,window.devicePixelRatio||1),width=canvas.clientWidth,height=canvas.clientHeight;
+  if(!width||!height)return;
+  const w=Math.round(width*dpr),h=Math.round(height*dpr);
+  if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;}
+  const ctx=canvas.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,width,height);
+  const left=45,right=12,top=13,bottom=25,pw=width-left-right,ph=height-top-bottom;
+  const now=points.length?points[points.length-1][0]:Date.now();
+  const xmin=now-6000,xmax=now;
+  const visible=points.filter(v=>v[0]>=xmin);
+  let ymin=0,ymax=4095;
+  if(!yFixed){
+    const values=visible.flatMap(p=>p.slice(1));
+    ymin=values.length?Math.min(...values,-0.2):-2;ymax=values.length?Math.max(...values,0.2):2;
+    const margin=Math.max(.08,(ymax-ymin)*.12);ymin-=margin;ymax+=margin;
+  }
+  const y=v=>top+(1-(v-ymin)/(ymax-ymin))*ph;
+  ctx.lineWidth=1;ctx.font='11px system-ui';
+  for(let k=0;k<=4;k++){
+    const val=ymin+(ymax-ymin)*(1-k/4),py=top+ph*k/4;
+    ctx.strokeStyle='#2b3b52';ctx.beginPath();ctx.moveTo(left,py);ctx.lineTo(width-right,py);ctx.stroke();
+    ctx.fillStyle='#a1b1c6';ctx.fillText(val.toFixed(yFixed?0:1),5,py+4);
+  }
+  ctx.fillStyle='#91a5bd';
+  for(let k=0;k<=3;k++)ctx.fillText(`${k*2-6}s`,left+pw*k/3-8,height-7);
+  const colors=['#70b8ff','#43dab0','#ff7189'];
+  for(let c=0;c<channels;c++){
+    ctx.beginPath();ctx.strokeStyle=colors[c];ctx.lineWidth=1.6;
+    let drawn=false;
+    for(const p of visible){
+      const px=left+((p[0]-xmin)/6000)*pw,py=y(p[c+1]);
+      if(!drawn){ctx.moveTo(px,py);drawn=true;} else ctx.lineTo(px,py);
+    }
+    if(drawn)ctx.stroke();
+  }
+}
+function render(){draw($('imuPlot'),imuPlot,3,false);draw($('micPlot'),micPlot,1,true);requestAnimationFrame(render);}
+setInterval(updateCounters,300);
+$('pair').onclick=pair;
+$('start').onclick=begin;
+$('stop').onclick=stop;
+$('imuCsv').onclick=()=>makeCsv('imu');
+$('micCsv').onclick=()=>makeCsv('mic');
+$('refresh').onclick=()=>{resetPlots();if(command&&!recording&&!draining)syncClock().catch(e=>log('Clock refresh failed: '+e.message));};
+refreshButtons();render();
+</script></body></html>
